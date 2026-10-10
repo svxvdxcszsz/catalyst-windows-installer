@@ -145,3 +145,262 @@ jobs:
           if ($failures.Count -gt 0) {
             Write-Error ($failures -join ' ')
           }
+
+  interactive-installer:
+    name: Interactive installer and backup directory test
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Run interactive installer test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workDir = Join-Path $env:RUNNER_TEMP 'catalyst-interactive-test'
+          $installDir = Join-Path $workDir 'installed-app'
+          $backupDir = Join-Path $workDir 'selected-auto-backup'
+          $assetPath = Join-Path $workDir 'Catalyst_0.1.0_x64-setup.exe'
+          $expectedHash = '51bee1addc8afe2bc8cae7ad280b83580e64f7cad13325c0b577649b900f075a'
+          $assetUri = 'https://github.com/svxvdxcszsz/catalyst-windows-installer/releases/download/v0.1.0-preview.1/Catalyst_0.1.0_x64-setup.exe'
+          $settingPath = Join-Path $env:APPDATA 'com.protonapp.foundation\auto-backup-directory.txt'
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $testFailures = [System.Collections.Generic.List[string]]::new()
+          $installerProcess = $null
+          $appProcess = $null
+          $selectedPath = $null
+
+          function Add-Result([string]$Message) {
+            Write-Host $Message
+            $summary.Add($Message)
+          }
+
+          function Get-WindowForProcess([int]$ProcessId) {
+            $root = [System.Windows.Automation.AutomationElement]::RootElement
+            $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+            foreach ($candidate in $windows) {
+              if ($candidate.Current.ProcessId -eq $ProcessId) { return $candidate }
+            }
+            return $null
+          }
+
+          function Get-Descendants($Window) {
+            return $Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+          }
+
+          function Invoke-Button($Button) {
+            $invoke = $Button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $invoke.Invoke()
+          }
+
+          function Save-DesktopScreenshot([string]$Path) {
+            Add-Type -AssemblyName System.Drawing
+            Add-Type -AssemblyName System.Windows.Forms
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try {
+              $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+              $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            } finally {
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
+          }
+
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+          $settingExisted = Test-Path -LiteralPath $settingPath -PathType Leaf
+          if ($settingExisted) {
+            [System.IO.File]::Copy($settingPath, (Join-Path $workDir 'previous-setting.bin'), $true)
+            Set-Content -LiteralPath (Join-Path $workDir 'setting-existed.txt') -Value 'true' -NoNewline
+          } else {
+            Set-Content -LiteralPath (Join-Path $workDir 'setting-existed.txt') -Value 'false' -NoNewline
+          }
+          $summary.Add('# Interactive installer and Auto Backup directory test')
+          $summary.Add('')
+          $summary.Add('Runner: `windows-2022` (GitHub-hosted Windows x64).')
+
+          try {
+            Invoke-WebRequest -Uri $assetUri -OutFile $assetPath
+            $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+            Add-Result "- Artifact SHA-256: $actualHash"
+            if ($actualHash -ne $expectedHash) { throw "Artifact checksum mismatch; expected $expectedHash." }
+
+            $webViewRoots = @(
+              'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients',
+              'HKCU:\Software\Microsoft\EdgeUpdate\Clients'
+            )
+            $webViewEntries = foreach ($root in $webViewRoots) {
+              if (Test-Path -LiteralPath $root) {
+                Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+                  $entry = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                  if ($entry.name -match 'WebView2 Runtime') { [pscustomobject]@{ Name = $entry.name; Version = $entry.pv } }
+                }
+              }
+            }
+            if ($webViewEntries) {
+              $runtimeVersions = ($webViewEntries | ForEach-Object { $_.Version } | Where-Object { $_ } | Sort-Object -Unique) -join ', '
+              Add-Result "- WebView2 Runtime: DETECTED ($runtimeVersions); no runtime was installed or changed."
+            } else {
+              Add-Result '- WebView2 Runtime: MISSING; installer configuration was not changed.'
+              $testFailures.Add('Microsoft Edge WebView2 Runtime is missing.')
+            }
+
+            $runnerProcess = Get-Process -Id $PID
+            Add-Result "- Desktop preflight: UserInteractive=$([Environment]::UserInteractive), PowerShell session=$($runnerProcess.SessionId)."
+            if (-not [Environment]::UserInteractive) {
+              Add-Result '- GUI interaction: BLOCKED; this runner process is not attached to an interactive desktop. No silent-install fallback was attempted.'
+              throw 'GUI interaction BLOCKED: runner has no interactive desktop.'
+            }
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            try { Save-DesktopScreenshot (Join-Path $workDir 'desktop-preflight.png'); Add-Result '- Desktop screenshot: captured before installer launch.' }
+            catch { Add-Result "- Desktop screenshot: unavailable ($($_.Exception.Message))." }
+
+            $installerProcess = Start-Process -FilePath $assetPath -ArgumentList @("/D=$installDir") -PassThru
+            Add-Result "- Installer process started: PID $($installerProcess.Id)."
+            $deadline = [DateTime]::UtcNow.AddMinutes(10)
+            $backupPageSeen = $false
+            $installButtonClicked = $false
+            $finishButtonClicked = $false
+            $pickerScreenshot = Join-Path $workDir 'backup-directory-picker.png'
+
+            while (-not $installerProcess.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+              $window = Get-WindowForProcess $installerProcess.Id
+              if ($null -eq $window) { Start-Sleep -Milliseconds 500; continue }
+              $controls = Get-Descendants $window
+              $labels = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text } | ForEach-Object { $_.Current.Name })
+              $pageText = $labels -join ' | '
+
+              if (-not $backupPageSeen -and ($pageText -match 'Auto Backup directory|Choose an existing writable folder')) {
+                $editControls = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit })
+                $fieldDetails = foreach ($edit in $editControls) {
+                  $value = ''
+                  try { $value = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { }
+                  "Name='$($edit.Current.Name)' AutomationId='$($edit.Current.AutomationId)' Class='$($edit.Current.ClassName)' Value='$value'"
+                }
+                Add-Result "- Picker controls found: $($editControls.Count); $($fieldDetails -join ' ; ')"
+                if ($editControls.Count -ne 1) { throw 'GUI interaction BLOCKED: could not identify one unambiguous Auto Backup directory edit control from the UI Automation tree.' }
+
+                $selectedPath = [System.IO.Path]::GetFullPath($backupDir)
+                $valuePattern = $editControls[0].GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                $valuePattern.SetValue($selectedPath)
+                $readBackPath = $editControls[0].GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+                Add-Result "- Picker selected path: $selectedPath"
+                Add-Result "- Picker control read-back: $readBackPath"
+                if ($readBackPath -cne $selectedPath) { throw 'The directory-picker control did not retain the exact selected test path.' }
+                try { Save-DesktopScreenshot $pickerScreenshot; Add-Result '- Backup-directory picker screenshot: captured.' }
+                catch { Add-Result "- Backup-directory picker screenshot: unavailable ($($_.Exception.Message))." }
+                $backupPageSeen = $true
+              }
+
+              $buttons = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button })
+              if ($backupPageSeen -and $pageText -match 'Auto Backup directory|Choose an existing writable folder') {
+                $button = $buttons | Where-Object { $_.Current.Name -match 'Next' } | Select-Object -First 1
+                if ($button) { Invoke-Button $button; Start-Sleep -Milliseconds 400; continue }
+              }
+              if ($backupPageSeen -and -not $installButtonClicked) {
+                $button = $buttons | Where-Object { $_.Current.Name -match 'Install' } | Select-Object -First 1
+                if ($button) { Invoke-Button $button; $installButtonClicked = $true; Add-Result '- Wizard: invoked the Install button by its UI Automation name.'; Start-Sleep -Milliseconds 400; continue }
+              }
+              if ($installButtonClicked) {
+                $autoRun = $controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and $_.Current.Name -match 'Run Catalyst' } | Select-Object -First 1
+                if ($autoRun) {
+                  try {
+                    $toggle = $autoRun.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+                    if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) { $toggle.Toggle() }
+                  } catch { }
+                }
+                $button = $buttons | Where-Object { $_.Current.Name -match 'Finish' } | Select-Object -First 1
+                if ($button -and -not $finishButtonClicked) { Invoke-Button $button; $finishButtonClicked = $true; Add-Result '- Wizard: invoked the Finish button by its UI Automation name.'; Start-Sleep -Milliseconds 250; continue }
+              }
+              if (-not $backupPageSeen -or (-not $installButtonClicked -and -not ($buttons | Where-Object { $_.Current.Name -match 'Install' }))) {
+                $button = $buttons | Where-Object { $_.Current.Name -match 'Next' } | Select-Object -First 1
+                if ($button) { Add-Result "- Wizard page advanced using UI Automation button '$($button.Current.Name)' (visible labels: $pageText)."; Invoke-Button $button; Start-Sleep -Milliseconds 400; continue }
+              }
+              Start-Sleep -Milliseconds 250
+            }
+
+            if (-not $backupPageSeen) { throw 'GUI interaction BLOCKED: the Auto Backup directory page was not exposed in the UI Automation tree.' }
+            if (-not $installerProcess.HasExited) { Stop-Process -Id $installerProcess.Id -Force -ErrorAction SilentlyContinue; throw 'Interactive installer exceeded the 10-minute bound.' }
+            Add-Result "- Interactive installer exit code: $($installerProcess.ExitCode)."
+            if ($installerProcess.ExitCode -ne 0) { throw "Interactive installer exited with code $($installerProcess.ExitCode)." }
+
+            $persistedPath = if (Test-Path -LiteralPath $settingPath -PathType Leaf) { [System.IO.File]::ReadAllText($settingPath) } else { $null }
+            Add-Result "- Selected path: $selectedPath"
+            Add-Result "- Persisted path: $persistedPath"
+            if ($persistedPath -cne $selectedPath) { throw 'Persisted Auto Backup directory does not exactly match the picker selection.' }
+            Add-Result '- Selected-versus-persisted path: PASS (exact string match).'
+            if (-not (Test-Path -LiteralPath $selectedPath -PathType Container)) { throw 'Selected Auto Backup test directory does not exist after installation.' }
+            Add-Result '- Selected Auto Backup directory exists: PASS.'
+
+            $appPath = Join-Path $installDir 'app.exe'
+            $loaderPath = Join-Path $installDir 'WebView2Loader.dll'
+            if (-not (Test-Path -LiteralPath $appPath -PathType Leaf) -or -not (Test-Path -LiteralPath $loaderPath -PathType Leaf)) {
+              throw "Installed-file verification failed (app.exe=$(Test-Path $appPath), WebView2Loader.dll=$(Test-Path $loaderPath))."
+            }
+            Add-Result '- Installed files: PASS (app.exe and WebView2Loader.dll).'
+
+            $appProcess = Start-Process -FilePath $appPath -PassThru
+            Add-Result "- Application process started: PID $($appProcess.Id)."
+            $appDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            $visibleWindow = $null
+            while ([DateTime]::UtcNow -lt $appDeadline -and -not $appProcess.HasExited) {
+              $visibleWindow = Get-WindowForProcess $appProcess.Id
+              if ($visibleWindow -and -not $visibleWindow.Current.IsOffscreen) { break }
+              Start-Sleep -Milliseconds 500
+            }
+            if ($appProcess.HasExited) {
+              Add-Result "- Application process: exited with code $($appProcess.ExitCode) before a visible window was found."
+              throw "Application exited before visible-window verification (code $($appProcess.ExitCode))."
+            }
+            if ($visibleWindow -and -not $visibleWindow.Current.IsOffscreen) {
+              Add-Result "- Visible application window: detected (title='$($visibleWindow.Current.Name)')."
+              try { Save-DesktopScreenshot (Join-Path $workDir 'application-window.png'); Add-Result '- Application screenshot: captured.' }
+              catch { Add-Result "- Application screenshot: unavailable ($($_.Exception.Message))." }
+            } else {
+              Add-Result '- Visible application window: NOT DETECTED within 30 seconds; process remained alive.'
+              throw 'Application process was alive but no visible top-level window was detected.'
+            }
+            Add-Result '- GUI verification: visible top-level application window detected; screenshot capture attempted. This confirms window presence, not functional UI correctness.'
+          } catch {
+            Add-Result "- INTERACTIVE TEST FAILURE/BLOCKER: $($_.Exception.Message)"
+            $testFailures.Add($_.Exception.Message)
+          } finally {
+            $summary | ForEach-Object { Write-Host $_ }
+            $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            if ($installerProcess -and -not $installerProcess.HasExited) { Stop-Process -Id $installerProcess.Id -Force -ErrorAction SilentlyContinue }
+            if ($appProcess -and -not $appProcess.HasExited) { Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+          if ($testFailures.Count -gt 0) { throw ($testFailures -join ' ') }
+
+      - name: Preserve diagnostic screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalyst-interactive-test-diagnostics
+          path: ${{ runner.temp }}/catalyst-interactive-test/*.png
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Clean up test installation and directories
+        if: always()
+        shell: powershell
+        run: |
+          $workDir = Join-Path $env:RUNNER_TEMP 'catalyst-interactive-test'
+          $assetPath = Join-Path $env:RUNNER_TEMP 'Catalyst_0.1.0_x64-setup.exe'
+          $settingPath = Join-Path $env:APPDATA 'com.protonapp.foundation\auto-backup-directory.txt'
+          if (Test-Path -LiteralPath $workDir) {
+            $settingExistedPath = Join-Path $workDir 'setting-existed.txt'
+            if (Test-Path -LiteralPath $settingExistedPath) {
+              if ((Get-Content -LiteralPath $settingExistedPath -Raw) -eq 'true') {
+                Copy-Item -LiteralPath (Join-Path $workDir 'previous-setting.bin') -Destination $settingPath -Force
+              } elseif (Test-Path -LiteralPath $settingPath) {
+                Remove-Item -LiteralPath $settingPath -Force
+              }
+            }
+            Remove-Item -LiteralPath $workDir -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $assetPath) { Remove-Item -LiteralPath $assetPath -Force }
