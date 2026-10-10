@@ -127,10 +127,10 @@ jobs:
                   $report.Add('```')
                   $report.Add('</details>')
                 } else {
-                  $report.Add("- $logLabel: no output.")
+                  $report.Add("- ${logLabel}: no output.")
                 }
               } else {
-                $report.Add("- $logLabel: not produced.")
+                $report.Add("- ${logLabel}: not produced.")
               }
             }
           } else {
