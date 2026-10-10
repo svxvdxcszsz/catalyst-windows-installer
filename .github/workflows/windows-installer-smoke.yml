@@ -245,7 +245,16 @@ jobs:
 
           function Save-WindowScreenshot($Window, [string]$Path) {
             if (-not $Window.Visible -or $Window.Minimized -or (Test-WindowOffscreen $Window)) { return $false }
-            return [CatalystWindowApi]::SaveWindowScreenshot([IntPtr]::new([long]$Window.Handle), $Path)
+            $bitmap = [System.Drawing.Bitmap]::new($Window.Width, $Window.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try {
+              $graphics.CopyFromScreen($Window.X, $Window.Y, 0, 0, $bitmap.Size)
+              $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+              return $true
+            } finally {
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
           }
 
           New-Item -ItemType Directory -Path $workDir -Force | Out-Null
@@ -302,8 +311,6 @@ jobs:
             Add-Type -TypeDefinition @'
           using System;
           using System.Collections.Generic;
-          using System.Drawing;
-          using System.Drawing.Imaging;
           using System.Runtime.InteropServices;
           using System.Text;
           public static class CatalystWindowApi {
@@ -326,9 +333,6 @@ jobs:
             [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr handle);
             [DllImport("user32.dll")] static extern bool IsIconic(IntPtr handle);
             [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr handle, out RECT rect);
-            [DllImport("user32.dll")] static extern IntPtr GetWindowDC(IntPtr handle);
-            [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr handle, IntPtr dc);
-            [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr handle, IntPtr dc, uint flags);
             private delegate bool EnumWindowsProc(IntPtr handle, IntPtr lParam);
             public static WindowInfo[] GetTopLevelWindows() {
               var result = new List<WindowInfo>();
@@ -340,20 +344,6 @@ jobs:
                 return true;
               }, IntPtr.Zero);
               return result.ToArray();
-            }
-            public static bool SaveWindowScreenshot(IntPtr handle, string path) {
-              RECT rect; if (!GetWindowRect(handle, out rect)) return false;
-              int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
-              if (width <= 0 || height <= 0) return false;
-              using (var bitmap = new Bitmap(width, height))
-              using (var graphics = Graphics.FromImage(bitmap)) {
-                IntPtr dc = graphics.GetHdc();
-                bool captured;
-                try { captured = PrintWindow(handle, dc, 2); }
-                finally { graphics.ReleaseHdc(dc); }
-                bitmap.Save(path, ImageFormat.Png);
-                return captured;
-              }
             }
           }
           '@
@@ -529,11 +519,11 @@ jobs:
                 foreach ($window in $visibleOnscreen) {
                   $windowShot = Join-Path $workDir ("catalyst-window-{0:X}.png" -f $window.Handle)
                   try {
-                    $printWindowSucceeded = Save-WindowScreenshot $window $windowShot
-                    if ($printWindowSucceeded) {
-                      Add-Result "- Separate window screenshot: PrintWindow captured $([System.IO.Path]::GetFileName($windowShot)) for handle $('0x{0:X}' -f $window.Handle)."
+                    $windowShotSucceeded = Save-WindowScreenshot $window $windowShot
+                    if ($windowShotSucceeded) {
+                      Add-Result "- Separate window screenshot: captured screen crop $([System.IO.Path]::GetFileName($windowShot)) for handle $('0x{0:X}' -f $window.Handle) using Win32-derived bounds."
                     } else {
-                      Add-Result "- Separate window screenshot: PrintWindow returned false for handle $('0x{0:X}' -f $window.Handle); bitmap retained for inspection."
+                      Add-Result "- Separate window screenshot: not attempted for hidden, minimized, or off-screen handle $('0x{0:X}' -f $window.Handle)."
                     }
                   } catch {
                     Add-Result "- Separate window screenshot: unavailable for handle $('0x{0:X}' -f $window.Handle) ($($_.Exception.Message))."
@@ -548,7 +538,7 @@ jobs:
             } else {
               Add-Result '- Application process: still running after the bounded UI capture period.'
             }
-            Add-Result '- GUI evidence: Win32 window enumeration and real desktop/window capture were attempted; screenshot contents require visual review and do not prove functional UI correctness.'
+            Add-Result '- GUI evidence: Win32 window enumeration, desktop capture, and a screen-region crop at the window bounds were attempted. The crop can include overlapping desktop content; screenshots require visual review and do not prove functional UI correctness.'
           } catch {
             Add-Result "- INTERACTIVE TEST FAILURE/BLOCKER: $($_.Exception.Message)"
             $testFailures.Add($_.Exception.Message)
