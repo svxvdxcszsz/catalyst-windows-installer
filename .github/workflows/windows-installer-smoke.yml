@@ -304,6 +304,10 @@ jobs:
                 $button = $buttons | Where-Object { $_.Current.Name -match 'Install' } | Select-Object -First 1
                 if ($button) { Invoke-Button $button; $installButtonClicked = $true; Add-Result '- Wizard: invoked the Install button by its UI Automation name.'; Start-Sleep -Milliseconds 400; continue }
               }
+              if ($backupPageSeen -and $pageText -match 'Installing|Please wait while .* is being installed') {
+                if (-not $installButtonClicked) { Add-Result '- Wizard: detected the Installing progress page.' }
+                $installButtonClicked = $true
+              }
               if ($installButtonClicked) {
                 $autoRun = $controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and $_.Current.Name -match 'Run Catalyst' } | Select-Object -First 1
                 if ($autoRun) {
