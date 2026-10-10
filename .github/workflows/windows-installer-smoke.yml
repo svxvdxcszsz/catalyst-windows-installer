@@ -164,13 +164,16 @@ jobs:
           $settingPath = Join-Path $env:APPDATA 'com.protonapp.foundation\auto-backup-directory.txt'
           $summary = [System.Collections.Generic.List[string]]::new()
           $testFailures = [System.Collections.Generic.List[string]]::new()
+          $diagnosticLog = Join-Path $workDir 'window-diagnostics.log'
           $installerProcess = $null
           $appProcess = $null
+          $appProcessIds = @()
           $selectedPath = $null
 
           function Add-Result([string]$Message) {
             Write-Host $Message
             $summary.Add($Message)
+            Add-Content -LiteralPath $diagnosticLog -Value $Message -ErrorAction SilentlyContinue
           }
 
           function Get-WindowForProcess([int]$ProcessId) {
@@ -212,6 +215,37 @@ jobs:
               $graphics.Dispose()
               $bitmap.Dispose()
             }
+          }
+
+          function Get-ApplicationProcessIds([int]$RootProcessId) {
+            $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+            $ids = [System.Collections.Generic.HashSet[int]]::new()
+            [void]$ids.Add($RootProcessId)
+            $changed = $true
+            while ($changed) {
+              $changed = $false
+              foreach ($process in $processes) {
+                if ($ids.Contains([int]$process.ParentProcessId) -and $ids.Add([int]$process.ProcessId)) { $changed = $true }
+              }
+            }
+            return @($ids)
+          }
+
+          function Get-ApplicationWindows([int[]]$ProcessIds) {
+            return @([CatalystWindowApi]::GetTopLevelWindows() | Where-Object { $ProcessIds -contains $_.ProcessId })
+          }
+
+          function Test-WindowOffscreen($Window) {
+            $windowRect = [System.Drawing.Rectangle]::new($Window.X, $Window.Y, $Window.Width, $Window.Height)
+            foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+              if ($screen.Bounds.IntersectsWith($windowRect)) { return $false }
+            }
+            return $true
+          }
+
+          function Save-WindowScreenshot($Window, [string]$Path) {
+            if (-not $Window.Visible -or $Window.Minimized -or (Test-WindowOffscreen $Window)) { return $false }
+            return [CatalystWindowApi]::SaveWindowScreenshot([IntPtr]::new([long]$Window.Handle), $Path)
           }
 
           New-Item -ItemType Directory -Path $workDir -Force | Out-Null
@@ -263,12 +297,64 @@ jobs:
 
             Add-Type -AssemblyName UIAutomationClient
             Add-Type -AssemblyName UIAutomationTypes
+            Add-Type -AssemblyName System.Drawing
+            Add-Type -AssemblyName System.Windows.Forms
             Add-Type -TypeDefinition @'
           using System;
+          using System.Collections.Generic;
+          using System.Drawing;
+          using System.Drawing.Imaging;
           using System.Runtime.InteropServices;
+          using System.Text;
           public static class CatalystWindowApi {
+            public sealed class WindowInfo {
+              public long Handle { get; set; }
+              public int ProcessId { get; set; }
+              public string Title { get; set; }
+              public bool Visible { get; set; }
+              public bool Minimized { get; set; }
+              public int X { get; set; }
+              public int Y { get; set; }
+              public int Width { get; set; }
+              public int Height { get; set; }
+            }
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
             [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
             [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out int processId);
+            [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr handle, StringBuilder text, int maxCount);
+            [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr handle);
+            [DllImport("user32.dll")] static extern bool IsIconic(IntPtr handle);
+            [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr handle, out RECT rect);
+            [DllImport("user32.dll")] static extern IntPtr GetWindowDC(IntPtr handle);
+            [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr handle, IntPtr dc);
+            [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr handle, IntPtr dc, uint flags);
+            private delegate bool EnumWindowsProc(IntPtr handle, IntPtr lParam);
+            public static WindowInfo[] GetTopLevelWindows() {
+              var result = new List<WindowInfo>();
+              EnumWindows((handle, param) => {
+                int pid; GetWindowThreadProcessId(handle, out pid);
+                RECT rect; if (!GetWindowRect(handle, out rect)) rect = new RECT();
+                var title = new StringBuilder(512); GetWindowText(handle, title, title.Capacity);
+                result.Add(new WindowInfo { Handle = handle.ToInt64(), ProcessId = pid, Title = title.ToString(), Visible = IsWindowVisible(handle), Minimized = IsIconic(handle), X = rect.Left, Y = rect.Top, Width = rect.Right - rect.Left, Height = rect.Bottom - rect.Top });
+                return true;
+              }, IntPtr.Zero);
+              return result.ToArray();
+            }
+            public static bool SaveWindowScreenshot(IntPtr handle, string path) {
+              RECT rect; if (!GetWindowRect(handle, out rect)) return false;
+              int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
+              if (width <= 0 || height <= 0) return false;
+              using (var bitmap = new Bitmap(width, height))
+              using (var graphics = Graphics.FromImage(bitmap)) {
+                IntPtr dc = graphics.GetHdc();
+                bool captured;
+                try { captured = PrintWindow(handle, dc, 2); }
+                finally { graphics.ReleaseHdc(dc); }
+                bitmap.Save(path, ImageFormat.Png);
+                return captured;
+              }
+            }
           }
           '@
             try { Save-DesktopScreenshot (Join-Path $workDir 'desktop-preflight.png'); Add-Result '- Desktop screenshot: captured before installer launch.' }
@@ -343,6 +429,16 @@ jobs:
               $finishButton = $buttons | Where-Object { $_.Current.Name -match 'Finish' } | Select-Object -First 1
               if ($finishButton) { $installButtonClicked = $true }
               if ($installButtonClicked) {
+                if ($pageText -match 'Installation Complete|Setup has finished installing') {
+                  $completionButton = $buttons | Where-Object { $_.Current.Name -match '^Next\s*>?$' } | Select-Object -First 1
+                  if ($completionButton) {
+                    Invoke-Button $completionButton
+                    $finishButtonClicked = $true
+                    Add-Result "- Wizard: advanced past the observed completion page using '$($completionButton.Current.Name)'."
+                    Start-Sleep -Milliseconds 300
+                    continue
+                  }
+                }
                 $autoRun = $controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and $_.Current.Name -match 'Run Catalyst' } | Select-Object -First 1
                 if ($autoRun) {
                   try {
@@ -381,26 +477,78 @@ jobs:
 
             $appProcess = Start-Process -FilePath $appPath -PassThru
             Add-Result "- Application process started: PID $($appProcess.Id)."
-            $appDeadline = [DateTime]::UtcNow.AddSeconds(30)
-            $visibleWindow = $null
-            while ([DateTime]::UtcNow -lt $appDeadline -and -not $appProcess.HasExited) {
-              $visibleWindow = Get-WindowForProcess $appProcess.Id
-              if ($visibleWindow -and -not $visibleWindow.Current.IsOffscreen) { break }
+            Start-Sleep -Seconds 5
+            $appDeadline = [DateTime]::UtcNow.AddSeconds(20)
+            $appWindows = @()
+            do {
+              $appProcessIds = @(Get-ApplicationProcessIds $appProcess.Id)
+              Add-Result "- Application process tree PIDs: $($appProcessIds -join ', ')."
+              $appWindows = @(Get-ApplicationWindows $appProcessIds)
+              if ($appWindows.Count -gt 0) { break }
+              if ($appProcess.HasExited) { break }
               Start-Sleep -Milliseconds 500
+            } while ([DateTime]::UtcNow -lt $appDeadline)
+
+            try {
+              $desktopShot = Join-Path $workDir 'catalyst-desktop-after-launch.png'
+              Save-DesktopScreenshot $desktopShot
+              Add-Result "- Actual desktop screenshot after launch: captured ($([System.IO.Path]::GetFileName($desktopShot)))."
+            } catch {
+              Add-Result "- Actual desktop screenshot after launch: unavailable ($($_.Exception.Message))."
+              $testFailures.Add("Desktop screenshot failed: $($_.Exception.Message)")
+            }
+
+            $windowRecords = @()
+            foreach ($window in $appWindows) {
+              $offscreen = Test-WindowOffscreen $window
+              $record = [pscustomobject]@{
+                Handle = ('0x{0:X}' -f $window.Handle)
+                Title = $window.Title
+                OwnerProcessId = $window.ProcessId
+                Visible = $window.Visible
+                Minimized = $window.Minimized
+                Offscreen = $offscreen
+                ScreenCoordinates = [pscustomobject]@{ X = $window.X; Y = $window.Y; Width = $window.Width; Height = $window.Height }
+              }
+              $windowRecords += $record
+              Add-Result ("- Win32 application window: " + ($record | ConvertTo-Json -Compress -Depth 4))
+            }
+            $windowRecords | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $workDir 'application-windows.json') -Encoding UTF8
+
+            if ($appWindows.Count -eq 0) {
+              Add-Result '- Window result: NO application top-level window was created for the app process or its descendants within 25 seconds.'
+              if (-not $appProcess.HasExited) { Add-Result '- Process result: app.exe remained alive, which is not evidence of a working UI.' }
+              $testFailures.Add('No application top-level window was created.')
+            } else {
+              $visibleOnscreen = @($appWindows | Where-Object { $_.Visible -and -not $_.Minimized -and -not (Test-WindowOffscreen $_) })
+              if ($visibleOnscreen.Count -eq 0) {
+                Add-Result '- Window result: a window exists, but all enumerated windows are hidden, minimized, or off-screen.'
+                $testFailures.Add('No visible, non-minimized, on-screen application window was found.')
+              } else {
+                Add-Result "- Window result: $($visibleOnscreen.Count) visible, non-minimized, on-screen window(s) found."
+                foreach ($window in $visibleOnscreen) {
+                  $windowShot = Join-Path $workDir ("catalyst-window-{0:X}.png" -f $window.Handle)
+                  try {
+                    $printWindowSucceeded = Save-WindowScreenshot $window $windowShot
+                    if ($printWindowSucceeded) {
+                      Add-Result "- Separate window screenshot: PrintWindow captured $([System.IO.Path]::GetFileName($windowShot)) for handle $('0x{0:X}' -f $window.Handle)."
+                    } else {
+                      Add-Result "- Separate window screenshot: PrintWindow returned false for handle $('0x{0:X}' -f $window.Handle); bitmap retained for inspection."
+                    }
+                  } catch {
+                    Add-Result "- Separate window screenshot: unavailable for handle $('0x{0:X}' -f $window.Handle) ($($_.Exception.Message))."
+                    $testFailures.Add("Window screenshot failed: $($_.Exception.Message)")
+                  }
+                }
+              }
             }
             if ($appProcess.HasExited) {
-              Add-Result "- Application process: exited with code $($appProcess.ExitCode) before a visible window was found."
-              throw "Application exited before visible-window verification (code $($appProcess.ExitCode))."
-            }
-            if ($visibleWindow -and -not $visibleWindow.Current.IsOffscreen) {
-              Add-Result "- Visible application window: detected (title='$($visibleWindow.Current.Name)')."
-              try { Save-DesktopScreenshot (Join-Path $workDir 'application-window.png'); Add-Result '- Application screenshot: captured.' }
-              catch { Add-Result "- Application screenshot: unavailable ($($_.Exception.Message))." }
+              Add-Result "- Application process exit: $($appProcess.ExitCode)."
+              if ($appProcess.ExitCode -ne 0) { $testFailures.Add("Application exited with code $($appProcess.ExitCode).") }
             } else {
-              Add-Result '- Visible application window: NOT DETECTED within 30 seconds; process remained alive.'
-              throw 'Application process was alive but no visible top-level window was detected.'
+              Add-Result '- Application process: still running after the bounded UI capture period.'
             }
-            Add-Result '- GUI verification: visible top-level application window detected; screenshot capture attempted. This confirms window presence, not functional UI correctness.'
+            Add-Result '- GUI evidence: Win32 window enumeration and real desktop/window capture were attempted; screenshot contents require visual review and do not prove functional UI correctness.'
           } catch {
             Add-Result "- INTERACTIVE TEST FAILURE/BLOCKER: $($_.Exception.Message)"
             $testFailures.Add($_.Exception.Message)
@@ -408,6 +556,7 @@ jobs:
             $summary | ForEach-Object { Write-Host $_ }
             $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             if ($installerProcess -and -not $installerProcess.HasExited) { Stop-Process -Id $installerProcess.Id -Force -ErrorAction SilentlyContinue }
+            foreach ($processId in $appProcessIds) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
             if ($appProcess -and -not $appProcess.HasExited) { Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue }
           }
 
@@ -418,7 +567,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: catalyst-interactive-test-diagnostics
-          path: ${{ runner.temp }}/catalyst-interactive-test/*.png
+          path: |
+            ${{ runner.temp }}/catalyst-interactive-test/*.png
+            ${{ runner.temp }}/catalyst-interactive-test/*.log
+            ${{ runner.temp }}/catalyst-interactive-test/*.json
+            ${{ runner.temp }}/catalyst-interactive-test/*.txt
           if-no-files-found: warn
           retention-days: 3
 
