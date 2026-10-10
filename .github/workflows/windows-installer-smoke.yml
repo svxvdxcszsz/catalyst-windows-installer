@@ -308,6 +308,8 @@ jobs:
                 if (-not $installButtonClicked) { Add-Result '- Wizard: detected the Installing progress page.' }
                 $installButtonClicked = $true
               }
+              $finishButton = $buttons | Where-Object { $_.Current.Name -match 'Finish' } | Select-Object -First 1
+              if ($finishButton) { $installButtonClicked = $true }
               if ($installButtonClicked) {
                 $autoRun = $controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and $_.Current.Name -match 'Run Catalyst' } | Select-Object -First 1
                 if ($autoRun) {
@@ -316,8 +318,7 @@ jobs:
                     if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) { $toggle.Toggle() }
                   } catch { }
                 }
-                $button = $buttons | Where-Object { $_.Current.Name -match 'Finish' } | Select-Object -First 1
-                if ($button -and -not $finishButtonClicked) { Invoke-Button $button; $finishButtonClicked = $true; Add-Result '- Wizard: invoked the Finish button by its UI Automation name.'; Start-Sleep -Milliseconds 250; continue }
+                if ($finishButton -and -not $finishButtonClicked) { Invoke-Button $finishButton; $finishButtonClicked = $true; Add-Result '- Wizard: invoked the Finish button by its UI Automation name.'; Start-Sleep -Milliseconds 250; continue }
               }
               if (-not $backupPageSeen -or (-not $installButtonClicked -and -not ($buttons | Where-Object { $_.Current.Name -match 'Install' }))) {
                 $button = $buttons | Where-Object { $_.Current.Name -match 'Next' } | Select-Object -First 1
