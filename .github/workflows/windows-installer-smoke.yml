@@ -423,7 +423,6 @@ jobs:
                   $completionButton = $buttons | Where-Object { $_.Current.Name -match '^Next\s*>?$' } | Select-Object -First 1
                   if ($completionButton) {
                     Invoke-Button $completionButton
-                    $finishButtonClicked = $true
                     Add-Result "- Wizard: advanced past the observed completion page using '$($completionButton.Current.Name)'."
                     Start-Sleep -Milliseconds 300
                     continue
