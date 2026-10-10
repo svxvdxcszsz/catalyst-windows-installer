@@ -295,7 +295,7 @@ jobs:
                 $backupPageSeen = $true
               }
 
-              $buttons = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button })
+              $buttons = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.IsEnabled })
               if ($backupPageSeen -and $pageText -match 'Auto Backup directory|Choose an existing writable folder') {
                 $button = $buttons | Where-Object { $_.Current.Name -match 'Next' } | Select-Object -First 1
                 if ($button) { Invoke-Button $button; Start-Sleep -Milliseconds 400; continue }
