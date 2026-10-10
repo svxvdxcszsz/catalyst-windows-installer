@@ -1,0 +1,146 @@
+name: Windows installer smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-smoke:
+    name: Published installer smoke test
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Download, verify, install, and launch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $report = [System.Collections.Generic.List[string]]::new()
+          $failures = [System.Collections.Generic.List[string]]::new()
+          $assetName = 'Catalyst_0.1.0_x64-setup.exe'
+          $assetUri = 'https://github.com/svxvdxcszsz/catalyst-windows-installer/releases/download/v0.1.0-preview.1/Catalyst_0.1.0_x64-setup.exe'
+          $expectedHash = '51bee1addc8afe2bc8cae7ad280b83580e64f7cad13325c0b577649b900f075a'
+          $assetPath = Join-Path $env:RUNNER_TEMP $assetName
+          $installDir = Join-Path $env:RUNNER_TEMP 'catalyst-installer-smoke'
+
+          $report.Add('# Published Windows installer smoke test')
+          $report.Add('')
+          $report.Add('Runner: `windows-2022` (GitHub-hosted Windows x64).')
+          $report.Add('')
+
+          Invoke-WebRequest -Uri $assetUri -OutFile $assetPath
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            $report.Add("- Artifact checksum: **FAIL** (`$actualHash`)")
+            $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            throw "SHA-256 mismatch for $assetName. Expected $expectedHash, got $actualHash."
+          }
+          $assetSize = (Get-Item -LiteralPath $assetPath).Length
+          $report.Add("- Artifact checksum: **PASS** (`$actualHash`, $assetSize bytes).")
+
+          $webViewRoots = @(
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients',
+            'HKCU:\Software\Microsoft\EdgeUpdate\Clients'
+          )
+          $webViewEntries = foreach ($root in $webViewRoots) {
+            if (Test-Path -LiteralPath $root) {
+              Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+                $entry = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                if ($entry.name -match 'WebView2 Runtime') {
+                  [pscustomobject]@{ Name = $entry.name; Version = $entry.pv }
+                }
+              }
+            }
+          }
+          if ($webViewEntries) {
+            $versions = ($webViewEntries | ForEach-Object { $_.Version } | Where-Object { $_ } | Sort-Object -Unique) -join ', '
+            $report.Add("- WebView2 Runtime: **DETECTED** ($versions).")
+          } else {
+            $report.Add('- WebView2 Runtime: **MISSING**. This installer uses `webviewInstallMode: skip`; the workflow does not install the runtime.')
+            Write-Warning 'Microsoft Edge WebView2 Runtime was not detected; it will not be installed by this workflow.'
+            $failures.Add('Required WebView2 Runtime is missing.')
+          }
+
+          if (Test-Path -LiteralPath $installDir) {
+            Remove-Item -LiteralPath $installDir -Recurse -Force
+          }
+          $installerExitCode = $null
+          try {
+            $installer = Start-Process -FilePath $assetPath -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            $installerExitCode = $installer.ExitCode
+            $report.Add("- Silent installer exit code: **$installerExitCode**.")
+            if ($installerExitCode -ne 0) {
+              $failures.Add("Installer exited with code $installerExitCode.")
+            }
+          } catch {
+            $report.Add("- Silent installer: **FAILED TO START** ($($_.Exception.Message)).")
+            $failures.Add("Installer execution failed: $($_.Exception.Message)")
+          }
+
+          $appPath = Join-Path $installDir 'app.exe'
+          $loaderPath = Join-Path $installDir 'WebView2Loader.dll'
+          $installedApp = Test-Path -LiteralPath $appPath -PathType Leaf
+          $installedLoader = Test-Path -LiteralPath $loaderPath -PathType Leaf
+          if ($installedApp -and $installedLoader) {
+            $report.Add('- Installed files: **PASS** (`app.exe`, `WebView2Loader.dll`).')
+            $installedFiles = Get-ChildItem -LiteralPath $installDir -File -Recurse | Select-Object -ExpandProperty Name
+            $report.Add("- Installed file count: $($installedFiles.Count).")
+          } else {
+            $report.Add("- Installed files: **FAIL** (app.exe=$installedApp, WebView2Loader.dll=$installedLoader).")
+            $failures.Add('Expected application executable or WebView2 loader is missing from the isolated install directory.')
+          }
+
+          if ($installedApp) {
+            $stdoutPath = Join-Path $env:RUNNER_TEMP 'catalyst-app.stdout.log'
+            $stderrPath = Join-Path $env:RUNNER_TEMP 'catalyst-app.stderr.log'
+            $appProcess = $null
+            try {
+              $appProcess = Start-Process -FilePath $appPath -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+              $report.Add("- Application process: **STARTED** (PID $($appProcess.Id)).")
+              if ($appProcess.WaitForExit(30000)) {
+                $appProcess.Refresh()
+                $appExitCode = $appProcess.ExitCode
+                $report.Add("- Application process exit: exited within 30 seconds with code $appExitCode.")
+                if ($appExitCode -ne 0) {
+                  $failures.Add("Application process exited with code $appExitCode.")
+                }
+              } else {
+                Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue
+                $report.Add('- Application process exit: still running after 30 seconds; terminated by the smoke test.')
+              }
+            } catch {
+              $report.Add("- Application process: **FAILED TO START** ($($_.Exception.Message)).")
+              $failures.Add("Application process failed to start: $($_.Exception.Message)")
+            }
+
+            foreach ($logPath in @($stdoutPath, $stderrPath)) {
+              $logLabel = [System.IO.Path]::GetFileName($logPath)
+              if (Test-Path -LiteralPath $logPath) {
+                $logText = (Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
+                if ($logText) {
+                  $report.Add("<details><summary>$logLabel (last 40 lines)</summary>")
+                  $report.Add('')
+                  $report.Add('```text')
+                  $report.Add($logText)
+                  $report.Add('```')
+                  $report.Add('</details>')
+                } else {
+                  $report.Add("- $logLabel: no output.")
+                }
+              } else {
+                $report.Add("- $logLabel: not produced.")
+              }
+            }
+          } else {
+            $report.Add('- Application process: **NOT ATTEMPTED** because `app.exe` was not installed.')
+          }
+
+          $report.Add('')
+          $report.Add('GUI verification: **NOT PERFORMED**. This workflow records process behavior only; it does not inspect a real interactive window.')
+          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          if ($failures.Count -gt 0) {
+            Write-Error ($failures -join ' ')
+          }
