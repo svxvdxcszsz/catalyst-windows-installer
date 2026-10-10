@@ -174,6 +174,14 @@ jobs:
           }
 
           function Get-WindowForProcess([int]$ProcessId) {
+            $foreground = [CatalystWindowApi]::GetForegroundWindow()
+            if ($foreground -ne [IntPtr]::Zero) {
+              $foregroundProcessId = 0
+              [void][CatalystWindowApi]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId)
+              if ($foregroundProcessId -eq $ProcessId) {
+                return [System.Windows.Automation.AutomationElement]::FromHandle($foreground)
+              }
+            }
             $root = [System.Windows.Automation.AutomationElement]::RootElement
             $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
             foreach ($candidate in $windows) {
@@ -255,6 +263,14 @@ jobs:
 
             Add-Type -AssemblyName UIAutomationClient
             Add-Type -AssemblyName UIAutomationTypes
+            Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class CatalystWindowApi {
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out int processId);
+          }
+          '@
             try { Save-DesktopScreenshot (Join-Path $workDir 'desktop-preflight.png'); Add-Result '- Desktop screenshot: captured before installer launch.' }
             catch { Add-Result "- Desktop screenshot: unavailable ($($_.Exception.Message))." }
 
@@ -265,6 +281,7 @@ jobs:
             $installButtonClicked = $false
             $finishButtonClicked = $false
             $pickerScreenshot = Join-Path $workDir 'backup-directory-picker.png'
+            $lastUiSignature = ''
 
             while (-not $installerProcess.HasExited -and [DateTime]::UtcNow -lt $deadline) {
               $window = Get-WindowForProcess $installerProcess.Id
@@ -272,6 +289,22 @@ jobs:
               $controls = Get-Descendants $window
               $labels = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text } | ForEach-Object { $_.Current.Name })
               $pageText = $labels -join ' | '
+              $buttons = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.IsEnabled })
+              $buttonNames = @($buttons | ForEach-Object { $_.Current.Name })
+              $uiSignature = "$($window.Current.Name)|$pageText|$($buttonNames -join ',')"
+              if ($uiSignature -cne $lastUiSignature) {
+                Add-Result "- NSIS UI state: title='$($window.Current.Name)'; labels='$pageText'; enabled buttons='$($buttonNames -join ',')'."
+                try {
+                  $stateImage = Join-Path $workDir ("nsis-state-{0:00}.png" -f ($summary.Count))
+                  Save-DesktopScreenshot $stateImage
+                  Add-Result "- NSIS state screenshot: $([System.IO.Path]::GetFileName($stateImage))."
+                } catch { Add-Result "- NSIS state screenshot unavailable ($($_.Exception.Message))." }
+                $lastUiSignature = $uiSignature
+              }
+
+              if ($window.Current.Name -notmatch 'Catalyst Setup|Nullsoft Install System') {
+                throw "Unexpected foreground installer dialog '$($window.Current.Name)' with enabled buttons '$($buttonNames -join ',')' and labels '$pageText'."
+              }
 
               if (-not $backupPageSeen -and ($pageText -match 'Auto Backup directory|Choose an existing writable folder')) {
                 $editControls = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit })
@@ -295,7 +328,6 @@ jobs:
                 $backupPageSeen = $true
               }
 
-              $buttons = @($controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.IsEnabled })
               if ($backupPageSeen -and $pageText -match 'Auto Backup directory|Choose an existing writable folder') {
                 $button = $buttons | Where-Object { $_.Current.Name -match 'Next' } | Select-Object -First 1
                 if ($button) { Invoke-Button $button; Start-Sleep -Milliseconds 400; continue }
