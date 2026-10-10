@@ -139,6 +139,7 @@ jobs:
 
           $report.Add('')
           $report.Add('GUI verification: **NOT PERFORMED**. This workflow records process behavior only; it does not inspect a real interactive window.')
+          $report | ForEach-Object { Write-Host $_ }
           $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           if ($failures.Count -gt 0) {
