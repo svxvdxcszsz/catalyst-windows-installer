@@ -445,6 +445,10 @@ jobs:
                   }
                   if (-not $toggle -or $toggle.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off) { throw 'Could not verify that Run Catalyst is unchecked; refusing to Finish and auto-launch from the installer.' }
                   Add-Result '- Run Catalyst option: verified unchecked before closing the installer.'
+                  try {
+                    Save-DesktopScreenshot (Join-Path $workDir 'installer-run-option-off.png')
+                    Add-Result '- Final installer page screenshot: captured after verifying Run Catalyst is unchecked.'
+                  } catch { Add-Result "- Final installer page screenshot unavailable ($($_.Exception.Message))." }
                 }
                 if ($finishButton -and $pageText -match 'Completing Catalyst Setup' -and $autoRunControls.Count -ne 1) {
                   throw 'Could not uniquely inspect the Run Catalyst option on the final setup page; refusing to Finish.'
@@ -457,6 +461,12 @@ jobs:
                     if ($finishHandle -eq [IntPtr]::Zero) { throw 'Finish button has no native handle for the bounded BM_CLICK fallback.' }
                     [void][CatalystWindowApi]::SendMessage($finishHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
                     Add-Result "- Wizard: sent BM_CLICK to the UIA-discovered Finish control HWND $($finishButton.Current.NativeWindowHandle)."
+                    Start-Sleep -Milliseconds 300
+                  }
+                  if (-not $installerProcess.HasExited) {
+                    $finishButton.SetFocus()
+                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                    Add-Result '- Wizard: focused the UIA-discovered Finish button and sent Enter.'
                   }
                   $finishButtonClicked = $true
                   $finishDeadline = [DateTime]::UtcNow.AddSeconds(8)
