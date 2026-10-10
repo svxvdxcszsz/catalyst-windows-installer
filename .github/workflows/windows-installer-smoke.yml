@@ -328,6 +328,7 @@ jobs:
             [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
             [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
             [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out int processId);
+            [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
             [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
             [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr handle, StringBuilder text, int maxCount);
             [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr handle);
@@ -428,12 +429,25 @@ jobs:
                     continue
                   }
                 }
-                $autoRun = $controls | Where-Object { $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox -and $_.Current.Name -match 'Run Catalyst' } | Select-Object -First 1
-                if ($autoRun) {
-                  try {
+                $autoRunControls = @($controls | Where-Object { $_.Current.Name -eq 'Run Catalyst' })
+                if ($autoRunControls.Count -gt 0) {
+                  if ($autoRunControls.Count -ne 1) { throw "Ambiguous Run Catalyst controls: $($autoRunControls.Count)." }
+                  $autoRun = $autoRunControls[0]
+                  Add-Result "- Run Catalyst option: UIA type=$($autoRun.Current.ControlType.ProgrammaticName), native HWND=$($autoRun.Current.NativeWindowHandle)."
+                  $toggle = $null
+                  try { $toggle = $autoRun.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) } catch { Add-Result "- TogglePattern unavailable: $($_.Exception.Message)" }
+                  if ($toggle -and $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) { $toggle.Toggle() }
+                  if ($toggle -and $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) {
+                    $controlHandle = [IntPtr]::new([int]$autoRun.Current.NativeWindowHandle)
+                    if ($controlHandle -eq [IntPtr]::Zero) { throw 'Run Catalyst remained checked and has no native control handle for a UIA-discovered BM_CLICK fallback.' }
+                    [void][CatalystWindowApi]::SendMessage($controlHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
                     $toggle = $autoRun.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-                    if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) { $toggle.Toggle() }
-                  } catch { }
+                  }
+                  if (-not $toggle -or $toggle.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off) { throw 'Could not verify that Run Catalyst is unchecked; refusing to Finish and auto-launch from the installer.' }
+                  Add-Result '- Run Catalyst option: verified unchecked before closing the installer.'
+                }
+                if ($finishButton -and $pageText -match 'Completing Catalyst Setup' -and $autoRunControls.Count -ne 1) {
+                  throw 'Could not uniquely inspect the Run Catalyst option on the final setup page; refusing to Finish.'
                 }
                 if ($finishButton -and -not $finishButtonClicked) { Invoke-Button $finishButton; $finishButtonClicked = $true; Add-Result '- Wizard: invoked the Finish button by its UI Automation name.'; Start-Sleep -Milliseconds 250; continue }
               }
